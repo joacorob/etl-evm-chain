@@ -1,0 +1,18 @@
+# General ignores
+.DS_Store
+.idea/
+.vscode/
+*.log
+bin/
+*.env
+
+# Build & dependency
+vendor/
+
+# Project specific artifacts
+.progress.json
+data/*.csv
+internal/progress/
+
+# Local configuration files
+config.yaml 
