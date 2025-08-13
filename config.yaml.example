@@ -2,16 +2,14 @@
 # Copy this file as `config.yaml` and adjust values as needed.
 
 rpc_url: "https://mainnet.infura.io/v3/YOUR_INFURA_KEY"
-start_block: 12345678
+start_block: 22946959
 chunk_size: 1000
-
 contracts:
   - name: "USDC"
     address: "0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" # example USDC address
-    abi: "./abi/token.json"
+    abi: "./abi/pool.json"
     events:
       - "Transfer"
-
 storage:
   type: "csv"            # "mysql" or "csv"
   mysql:
