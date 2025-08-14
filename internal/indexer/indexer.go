@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"math/big"
+	"sync"
 	"time"
 
 	"etl-web3/internal/config"
@@ -122,35 +123,81 @@ func (idx *Indexer) Run(ctx context.Context) error {
         return err
     }
 
-    from := idx.cfg.StartBlock
+    startFrom := idx.cfg.StartBlock
 
-    logrus.Infof("Starting indexer | from=%d latest=%d chunkSize=%d", from, latest, idx.chunkSize)
+    logrus.Infof("Starting indexer | from=%d latest=%d chunkSize=%d workers=%d", startFrom, latest, idx.chunkSize, idx.cfg.Workers)
 
-    for from <= latest {
-        // Respect context cancellation early.
-        if err := ctx.Err(); err != nil {
-            return err
+    // Prepare jobs for workers
+    type job struct{ from, to uint64 }
+    jobs := make(chan job, idx.cfg.Workers*2)
+    errCh := make(chan error, idx.cfg.Workers)
+
+    // Derive a cancellable context for early termination on first error
+    wctx, cancel := context.WithCancel(ctx)
+    defer cancel()
+
+    var wg sync.WaitGroup
+    worker := func() {
+        defer wg.Done()
+        for j := range jobs {
+            select {
+            case <-wctx.Done():
+                return
+            default:
+            }
+
+            startTs := time.Now()
+            evCount, err := idx.processRange(wctx, j.from, j.to)
+            if err != nil {
+                // Notify first error and cancel the rest
+                select {
+                case errCh <- err:
+                default:
+                }
+                cancel()
+                return
+            }
+            elapsed := time.Since(startTs).Seconds()
+            logrus.Infof("[OK] Block %d → %d | Events: %d | Time: %.2fs", j.from, j.to, evCount, elapsed)
         }
+    }
 
+    // Launch workers
+    for i := 0; i < idx.cfg.Workers; i++ {
+        wg.Add(1)
+        go worker()
+    }
+
+    // Enqueue jobs
+enqueue:
+    for from := startFrom; from <= latest; {
         to := from + idx.chunkSize - 1
         if to > latest {
             to = latest
         }
-
-        start := time.Now()
-        evCount, err := idx.processRange(ctx, from, to)
-        if err != nil {
-            return err
+        j := job{from: from, to: to}
+        select {
+        case <-wctx.Done():
+            break enqueue
+        case jobs <- j:
         }
-        elapsed := time.Since(start).Seconds()
-
-        logrus.Infof("[OK] Block %d → %d | Events: %d | Time: %.2fs", from, to, evCount, elapsed)
-
-        // Move window forward.
+        if to == latest {
+            break
+        }
         from = to + 1
     }
+    close(jobs)
 
-    return nil
+    // Wait for workers to finish
+    wg.Wait()
+
+    // Return first error if any
+    select {
+    case e := <-errCh:
+        return e
+    default:
+        return nil
+    }
 }
 
 // processRange fetches, parses and persists logs within the [from, to] block

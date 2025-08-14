@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"etl-web3/internal/config"
 	"etl-web3/internal/rpc"
@@ -24,6 +25,7 @@ type Parser struct {
     // timestampCache allows reusing block timestamps when multiple events
     // belong to the same block, saving additional RPC calls.
     timestampCache map[uint64]uint64
+    mu sync.RWMutex
 }
 
 // New builds a Parser using the loaded configuration and an initialised RPC
@@ -55,7 +57,7 @@ func (p *Parser) Parse(ctx context.Context, lg *types.Log) (sink.Event, error) {
             evt["contract_name"] = cfg.Name
         }
         // No ABI for this address – return minimal info so it is not lost.
-        p.enrichWithBlockAndTx(ctx, lg, evt)
+    p.enrichWithBlockAndTx(ctx, lg, evt)
         return evt, nil
     }
 
@@ -115,26 +117,41 @@ func (p *Parser) Parse(ctx context.Context, lg *types.Log) (sink.Event, error) {
 // RPC calls. Failures are silently ignored so they do not block main parsing.
 func (p *Parser) enrichWithBlockAndTx(ctx context.Context, lg *types.Log, evt sink.Event) {
     // Block timestamp (with cache to avoid repeated RPC calls).
-    if ts, ok := p.timestampCache[lg.BlockNumber]; ok {
+    p.mu.RLock()
+    ts, ok := p.timestampCache[lg.BlockNumber]
+    p.mu.RUnlock()
+    if ok {
         evt["timestamp"] = ts
     } else if hdr, err := p.client.GetHeaderByNumber(ctx, big.NewInt(int64(lg.BlockNumber))); err == nil {
         evt["timestamp"] = hdr.Time
+        p.mu.Lock()
         p.timestampCache[lg.BlockNumber] = hdr.Time
+        p.mu.Unlock()
     }
 
     // Transaction sender.
-    if p.chainID == nil {
+    p.mu.RLock()
+    chainKnown := p.chainID != nil
+    p.mu.RUnlock()
+    if !chainKnown {
         if id, err := p.client.NetworkID(ctx); err == nil {
-            p.chainID = id
+            p.mu.Lock()
+            if p.chainID == nil { // double-check under lock
+                p.chainID = id
+            }
+            p.mu.Unlock()
         }
     }
     // Include chain_id in event once it is known.
-    if p.chainID != nil {
-        evt["chain_id"] = p.chainID.String()
+    p.mu.RLock()
+    cid := p.chainID
+    p.mu.RUnlock()
+    if cid != nil {
+        evt["chain_id"] = cid.String()
     }
-    if p.chainID != nil {
+    if cid != nil {
         if tx, _, err := p.client.Client.TransactionByHash(ctx, lg.TxHash); err == nil {
-            signer := types.LatestSignerForChainID(p.chainID)
+            signer := types.LatestSignerForChainID(cid)
             if from, err := types.Sender(signer, tx); err == nil {
                 evt["tx_from"] = from.Hex()
             }

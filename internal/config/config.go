@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 
@@ -44,6 +45,9 @@ type Config struct {
     // ChunkSize defines how many blocks will be processed per batch when fetching logs.
     // If not set, a sensible default will be applied by the loader.
     ChunkSize  uint64           `yaml:"chunk_size"`
+    // Workers defines how many concurrent workers will process block ranges.
+    // If not set, it defaults to the number of available CPUs.
+    Workers    int              `yaml:"workers"`
 }
 
 // Load reads and unmarshals the configuration file located at the given path.
@@ -138,6 +142,14 @@ func Load(path string) (*Config, error) {
     // Apply default chunk size if not specified (allows backward-compatible configs).
     if cfg.ChunkSize == 0 {
         cfg.ChunkSize = 1_000
+    }
+
+    // Default workers to the number of CPUs when not provided or invalid.
+    if cfg.Workers <= 0 {
+        cfg.Workers = runtime.NumCPU()
+        if cfg.Workers < 1 {
+            cfg.Workers = 1
+        }
     }
 
     return &cfg, nil

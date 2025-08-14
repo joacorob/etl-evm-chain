@@ -4,6 +4,7 @@
 rpc_url: "https://mainnet.infura.io/v3/YOUR_INFURA_KEY"
 start_block: 22946959
 chunk_size: 1000
+workers: 4
 contracts:
   - name: "USDC"
     address: "0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" # example USDC address
