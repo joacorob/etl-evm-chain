@@ -193,6 +193,7 @@ def backtest_fee_block(
     band_ticks_param: int,
     band_steps: int | None,
     fee_share: float,
+    slippage_rate: float,
     verbose: bool = False,
 ) -> pd.DataFrame:
     trades: List[dict] = []
@@ -248,6 +249,7 @@ def backtest_fee_block(
                         "entry_z": float(z),
                         "size_units": 1000.0,
                         "fees_usd": 0.0,
+                        "slippage_usd": float(1000.0 * slippage_rate),
                     }
                     if verbose:
                         print(f"[ENTRY] {pair} fee={fee} t={t} z={z:.2f} dir={'LONG' if direction>0 else 'SHORT'} tick={entry_tick}")
@@ -275,7 +277,7 @@ def backtest_fee_block(
                     cur["exit_tick"] = int(tick) if pd.notna(tick) else np.nan
                     cur["exit_z"] = float(z) if pd.notna(z) else np.nan
                     cur["exit_reason"] = exit_reason
-                    cur["pnl_usd"] = cur["fees_usd"]
+                    cur["pnl_usd"] = cur["fees_usd"] - cur["slippage_usd"]
                     trades.append(cur)
                     if verbose:
                         print(f"[EXIT] {pair} fee={fee} t={t} reason={exit_reason} pnl={cur['pnl_usd']:.2f}")
@@ -289,7 +291,7 @@ def backtest_fee_block(
             cur["exit_tick"] = int(last.get(f"tick_{pair}", np.nan)) if pd.notna(last.get(f"tick_{pair}", np.nan)) else np.nan
             cur["exit_z"] = float(last.get(f"z_{pair}", np.nan)) if pd.notna(last.get(f"z_{pair}", np.nan)) else np.nan
             cur["exit_reason"] = "eod"
-            cur["pnl_usd"] = cur["fees_usd"]
+            cur["pnl_usd"] = cur["fees_usd"] - cur["slippage_usd"]
             trades.append(cur)
             if verbose:
                 print(f"[EXIT] {pair} fee={fee} End-of-data pnl={cur['pnl_usd']:.2f}")
@@ -297,7 +299,7 @@ def backtest_fee_block(
     if not trades:
         return pd.DataFrame(columns=[
             "fee","pair","dir","entry_time","exit_time","entry_tick","exit_tick","entry_z","exit_z",
-            "band_ticks","lower_tick","upper_tick","size_units","fees_usd","pnl_usd","exit_reason"
+            "band_ticks","lower_tick","upper_tick","size_units","fees_usd","slippage_usd","pnl_usd","exit_reason"
         ])
     return pd.DataFrame(trades)
 
@@ -311,6 +313,8 @@ def parse_args():
     ap.add_argument("--band-ticks", type=int, default=20, help="Ancho de banda en ticks (deprecated si usas --band-steps)")
     ap.add_argument("--band-steps", type=int, default=None, help="Ancho de banda como múltiplos de tickSpacing (recomendado)")
     ap.add_argument("--fee-share", type=float, default=0.02, help="Proxy de tu % de liquidez activa (0.02=2%)")
+    ap.add_argument("--starting-capital", type=float, default=80000.0, help="Capital inicial depositado en Aave (USD)")
+    ap.add_argument("--slippage-rate", type=float, default=0.001, help="Slippage asumido en swap de entrada (proporción, 0.001 = 0.1%)")
     ap.add_argument("--resample", type=str, default="1min", help="Frecuencia para señal (p.ej. 1min, 5min)")
     ap.add_argument("--lookback", type=int, default=1440, help="Ventana en barras para media/std del spread")
     ap.add_argument("--verbose", action="store_true", help="Mostrar logs detallados durante el backtest")
@@ -344,6 +348,7 @@ def main():
             band_ticks_param=args.band_ticks,
             band_steps=args.band_steps,
             fee_share=args.fee_share,
+            slippage_rate=args.slippage_rate,
             verbose=args.verbose,
         )
         if not trades_fee.empty:
@@ -359,12 +364,17 @@ def main():
 
     total_pnl = trades["pnl_usd"].sum()
     n_trades = len(trades)
+    starting_capital = args.starting_capital
+    final_capital = starting_capital + total_pnl
     by_fee = trades.groupby("fee")["pnl_usd"].agg(["count", "sum"]).reset_index()
     by_pair = trades.groupby("pair")["pnl_usd"].agg(["count", "sum"]).reset_index()
 
     print("\n================ BACKTEST SUMMARY ================")
     print(f"Trades totales: {n_trades}")
     print(f"PNL total (USD, solo fees estimadas): {total_pnl:,.2f}\n")
+    print(f"Capital inicial: {starting_capital:,.2f} USD")
+    print(f"Capital final: {final_capital:,.2f} USD")
+    print(f"ROI: {final_capital/starting_capital - 1:.2%}\n")
 
     print("PNL por fee:")
     print(by_fee.to_string(index=False))
