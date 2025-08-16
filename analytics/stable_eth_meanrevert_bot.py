@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+#  python analytics/stable_eth_meanrevert_bot.py \
+#     --data   ./data \
+#     --freq   120s \
+#     --mode   zscore \
+#     --report \
+#     --notional      1000 \
+#     --start_capital 80000 \
+#     --trades_csv    my_trades.csv
 """
 Mean-reversion bot for Stable/ETH pools
 ======================================
@@ -278,6 +287,9 @@ def main():
     p.add_argument("--exit_z",  type=float, default=0.2, help="(zscore) |Z| threshold to close trade (default 0.2)")
     p.add_argument("--max_hold", type=int, default=10080, help="(zscore) Max holding period in rows (default 10080 ≈1w @60s)")
     p.add_argument("--report", action="store_true", help="Print trades & performance summary")
+    p.add_argument("--notional", type=float, default=1000.0, help="Trade notional size in stable units per position (default 1000)")
+    p.add_argument("--start_capital", type=float, default=80000.0, help="Initial capital in stable units (default 80000)")
+    p.add_argument("--trades_csv", type=str, default="trades.csv", help="Output CSV file path for executed trades (default trades.csv)")
 
     args = p.parse_args()
 
@@ -299,6 +311,10 @@ def main():
         )
     print(f"✓ Completed: {len(trades)} trades generated")
 
+    # Compute PnL for each trade based on fixed notional and persist to CSV
+    trades["pnl"] = trades["pct_return"] * args.notional  # profit/loss in stable units
+    trades.to_csv(args.trades_csv, index=False)
+
     monthly, yearly = aggregate_returns(trades)
 
     if args.report:
@@ -311,8 +327,12 @@ def main():
 
     # Quick summary always
     hr("SUMMARY")
-    total = trades["pct_return"].sum() if not trades.empty else 0.0
-    print(f"Total strategy return over back-test: {total*100:.2f}% (un-compounded) across {len(trades)} trades\n")
+    total_pct = trades["pct_return"].sum() if not trades.empty else 0.0
+    total_profit = trades["pnl"].sum() if not trades.empty else 0.0
+    final_balance = args.start_capital + total_profit
+
+    print(f"Total strategy return over back-test: {total_pct*100:.2f}% (un-compounded) across {len(trades)} trades")
+    print(f"Total profit: {total_profit:.2f} stable units (starting capital {args.start_capital:.2f} → final balance {final_balance:.2f})\n")
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
