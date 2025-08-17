@@ -40,6 +40,7 @@ from typing import Dict, List, Tuple, Any
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from collections import deque
 
 # ─────────────────────────── constants ────────────────────────────
 STABLES = ("DAI", "USDC", "USDT")
@@ -91,10 +92,9 @@ def csv_to_usd_per_eth_ticks(path: str) -> pd.DataFrame:
 
     df = _read_one_csv(path)
 
-    # Correct polarity: if median tick <0 ⇒ token1/token0 <1 ⇒ (stable/ETH) ticks are *already* usd/eth.
-    # else we flip the sign.
-    med = df["tick"].median()
-    usd_per_eth_tick = df["tick"].values if med < 0 else -df["tick"].values
+    # Convert tick → USD/ETH price ticks by flipping sign (token0=stable, token1=ETH)
+    # USD per ETH = 1 / (ETH per USD) = 1.0001^{-tick}
+    usd_per_eth_tick = -df["tick"].values
 
     out = pd.DataFrame({
         "timestamp": df["timestamp"].values,
@@ -111,6 +111,28 @@ def resample_ticks(df: pd.DataFrame, freq: str="60s") -> pd.DataFrame:
     out["stable"] = df["stable"].iloc[0]
     out["fee"]    = df["fee"].iloc[0]
     return out
+
+# ─────────────────────────── event-stream builder ────────────────────────────
+
+def build_event_stream(csv_paths: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+    """Return DataFrame[ timestamp, pool, price ] sorted by *timestamp* and list of pools."""
+    events: List[pd.DataFrame] = []
+    for p in tqdm(csv_paths, desc="Reading CSVs"):
+        ticks = csv_to_usd_per_eth_ticks(p)
+        ticks["price"] = LOG_BASE ** ticks["usd_per_eth_tick"]
+        # Filter out obvious outliers (e.g., bad data)
+        ticks = ticks[(ticks["price"] >= 50.0) & (ticks["price"] <= 10000.0)]
+        if ticks.empty:
+            continue  # Skip files with no valid rows after filtering
+        pool_name = f"{ticks['stable'].iloc[0]}ETH{ticks['fee'].iloc[0]}"
+        tmp = ticks[["timestamp", "price"]].copy()
+        tmp["pool"] = pool_name
+        events.append(tmp)
+
+    all_events = pd.concat(events, ignore_index=True)
+    all_events = all_events.sort_values("timestamp").reset_index(drop=True)
+    pools = sorted(all_events["pool"].unique())
+    return all_events, pools
 
 # ─────────────────────────── core logic ──────────────────────────
 
@@ -186,76 +208,126 @@ def simulate_mean_reversion(df: pd.DataFrame, pools: List[str], thr_pct: float=0
                 open_pos.pop(pool)
     return pd.DataFrame(trades)
 
-# ─────────────────────────── alternative Z-score strategy ─────────
+# ───────────────── event-level simulations (no resampling) ────────────────
 
-def simulate_zscore_reversion(df: pd.DataFrame, pools: List[str], *, lookback: int = 1440, entry_z: float = 2.0, exit_z: float = 0.2, max_hold: int = 10080) -> pd.DataFrame:
-    """Simulates mean-reversion using rolling Z-scores.
+def simulate_mean_reversion_events(events: pd.DataFrame, pools: List[str], thr_pct: float = 0.10) -> pd.DataFrame:
+    """Mean-reversion on raw event stream (ordered by timestamp)."""
+    threshold = thr_pct / 100.0
+    last_price: Dict[str, float] = {}
+    open_pos: Dict[str, Dict[str, Any]] = {}
+    trades: List[Dict[str, Any]] = []
 
-    Parameters
-    ----------
-    df        : DataFrame of prices as returned by build_price_matrix.
-    lookback  : Rolling window length (in rows) to compute mean/std (e.g. 1440 rows ≈ 1 day @60s).
-    entry_z   : |Z| threshold to open a trade.
-    exit_z    : |Z| threshold to close (default 0.2 ≈ back to near-mean).
-    max_hold  : Maximum holding period (rows). Forces exit even if |Z|>exit_z.
-    """
+    for idx, row in events.iterrows():
+        ts   = row["timestamp"]
+        pool = row["pool"]
+        price = row["price"]
 
-    # Pre-compute rolling mean/std of deviations per pool
-    consensus = df[pools].mean(axis=1)
-    dev_df    = df[pools].sub(consensus, axis=0)
+        # Update latest price of this pool
+        last_price[pool] = price
 
-    roll_mean = dev_df.rolling(lookback, min_periods=lookback).mean()
-    roll_std  = dev_df.rolling(lookback, min_periods=lookback).std(ddof=0)
-    z_df      = (dev_df - roll_mean) / roll_std
+        # Wait until we have at least one price for every pool
+        if len(last_price) < len(pools):
+            continue
 
-    open_pos: Dict[str, Dict[str,Any]] = {}
-    trades: List[Dict[str,Any]] = []
+        mean_price = np.mean(list(last_price.values()))
+        dev = (price - mean_price) / mean_price  # +ve ⇒ overpriced (short signal)
 
-    for idx in range(len(df)):
-        ts = df["timestamp"].iloc[idx]
-        for pool in pools:
-            z = z_df[pool].iloc[idx]
-            if math.isnan(z):
-                continue  # not enough history yet
+        pos = open_pos.get(pool)
 
-            pos = open_pos.get(pool)
+        # Entry logic
+        if pos is None:
+            if dev <= -threshold:   # LONG
+                open_pos[pool] = {"side": "long", "entry_ts": ts, "entry_price": price, "entry_dev": dev}
+            elif dev >= threshold:  # SHORT
+                open_pos[pool] = {"side": "short", "entry_ts": ts, "entry_price": price, "entry_dev": dev}
+            continue
 
-            # Entry
-            if pos is None:
-                if z <= -entry_z:
-                    open_pos[pool] = {"side":"long", "entry_idx":idx, "entry_ts":ts, "entry_price":df[pool].iloc[idx], "entry_z":z}
-                elif z >=  entry_z:
-                    open_pos[pool] = {"side":"short","entry_idx":idx, "entry_ts":ts, "entry_price":df[pool].iloc[idx], "entry_z":z}
-                continue
+        # Exit logic (mean reversion)
+        side = pos["side"]
+        if (side == "long" and dev >= 0) or (side == "short" and dev <= 0):
+            pct_ret = (price - pos["entry_price"]) / pos["entry_price"] if side == "long" else (pos["entry_price"] - price) / pos["entry_price"]
+            trades.append({
+                "pool": pool,
+                "side": side,
+                "entry_ts": pos["entry_ts"],
+                "exit_ts": ts,
+                "entry_price": pos["entry_price"],
+                "exit_price": price,
+                "pct_return": pct_ret,
+            })
+            open_pos.pop(pool)
 
-            # Exit conditions
-            held = idx - pos["entry_idx"]
-            side = pos["side"]
-            price = df[pool].iloc[idx]
+    return pd.DataFrame(trades)
 
-            exit_cond = False
-            if side=="long" and z >= -exit_z:
-                exit_cond = True
-            elif side=="short" and z <=  exit_z:
-                exit_cond = True
-            elif held >= max_hold:
-                exit_cond = True  # time stop
 
-            if exit_cond:
-                pct_ret = (price - pos["entry_price"])/pos["entry_price"] if side=="long" else (pos["entry_price"] - price)/pos["entry_price"]
-                trades.append({
-                    "pool": pool,
-                    "side": side,
-                    "entry_ts": pos["entry_ts"],
-                    "exit_ts": ts,
-                    "entry_price": pos["entry_price"],
-                    "exit_price": price,
-                    "entry_z": pos["entry_z"],
-                    "exit_z": z,
-                    "pct_return": pct_ret,
-                    "held_rows": held
-                })
-                open_pos.pop(pool)
+def simulate_zscore_reversion_events(events: pd.DataFrame, pools: List[str], *, lookback: int = 1440, entry_z: float = 2.0, exit_z: float = 0.2, max_hold: int = 10080) -> pd.DataFrame:
+    """Z-score based mean-reversion on raw event stream."""
+    last_price: Dict[str, float] = {}
+    dev_hist: Dict[str, deque] = {p: deque(maxlen=lookback) for p in pools}
+    open_pos: Dict[str, Dict[str, Any]] = {}
+    trades: List[Dict[str, Any]] = []
+
+    for idx, row in events.iterrows():
+        ts   = row["timestamp"]
+        pool = row["pool"]
+        price = row["price"]
+
+        last_price[pool] = price
+
+        # Need all pools priced at least once
+        if len(last_price) < len(pools):
+            continue
+
+        mean_price = np.mean(list(last_price.values()))
+        dev = (price - mean_price) / mean_price
+
+        # Update rolling history for this pool
+        hist = dev_hist[pool]
+        hist.append(dev)
+
+        if len(hist) < lookback:
+            continue  # Not enough history yet
+
+        roll_mean = np.mean(hist)
+        roll_std  = np.std(hist, ddof=0)
+        z = 0.0 if roll_std == 0 else (dev - roll_mean) / roll_std
+
+        pos = open_pos.get(pool)
+
+        # Entry
+        if pos is None:
+            if z <= -entry_z:
+                open_pos[pool] = {"side": "long", "entry_idx": idx, "entry_ts": ts, "entry_price": price, "entry_z": z}
+            elif z >= entry_z:
+                open_pos[pool] = {"side": "short", "entry_idx": idx, "entry_ts": ts, "entry_price": price, "entry_z": z}
+            continue
+
+        # Exit conditions
+        held = idx - pos["entry_idx"]
+        side = pos["side"]
+        exit_cond = False
+        if side == "long" and z >= -exit_z:
+            exit_cond = True
+        elif side == "short" and z <= exit_z:
+            exit_cond = True
+        elif held >= max_hold:
+            exit_cond = True  # time stop
+
+        if exit_cond:
+            pct_ret = (price - pos["entry_price"]) / pos["entry_price"] if side == "long" else (pos["entry_price"] - price) / pos["entry_price"]
+            trades.append({
+                "pool": pool,
+                "side": side,
+                "entry_ts": pos["entry_ts"],
+                "exit_ts": ts,
+                "entry_price": pos["entry_price"],
+                "exit_price": price,
+                "entry_z": pos["entry_z"],
+                "exit_z": z,
+                "pct_return": pct_ret,
+                "held_rows": held,
+            })
+            open_pos.pop(pool)
 
     return pd.DataFrame(trades)
 
@@ -295,15 +367,15 @@ def main():
 
     hr("LOADING DATA")
     csvs = list_swap_csvs(args.data)
-    df_prices, pools = build_price_matrix(csvs, freq=args.freq)
-    print(f"✓ Joined dataset: {len(df_prices)} rows, {len(pools)} pools on grid {args.freq}")
+    events_df, pools = build_event_stream(csvs)
+    print(f"✓ Loaded event stream: {len(events_df)} events across {len(pools)} pools")
 
     hr("SIMULATING")
     if args.mode == "pct":
-        trades = simulate_mean_reversion(df_prices, pools, thr_pct=args.thr)
+        trades = simulate_mean_reversion_events(events_df, pools, thr_pct=args.thr)
     else:
-        trades = simulate_zscore_reversion(
-            df_prices, pools,
+        trades = simulate_zscore_reversion_events(
+            events_df, pools,
             lookback=args.lookback,
             entry_z=args.entry_z,
             exit_z=args.exit_z,
