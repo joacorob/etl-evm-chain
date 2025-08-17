@@ -503,9 +503,9 @@ def main():
     if args.report:
         hr("TRADES (head)")
         print(trades.head())
-        hr("MONTHLY RETURNS (Σ pct)")
+        hr("MONTHLY RETURNS (Σ pct & profit)")
         print(monthly.tail(24))
-        hr("YEARLY RETURNS (Σ pct)")
+        hr("YEARLY RETURNS (Σ pct & profit)")
         print(yearly)
 
     # Quick summary always
