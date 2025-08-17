@@ -41,6 +41,58 @@ STABLES = ("DAI", "USDC", "USDT")
 FEES    = ("100", "500", "3000")
 FILE_RGX = re.compile(r"(?P<stable>DAI|USDC|USDT)ETH(?P<fee>100|500|3000)_Swap\.csv$", re.IGNORECASE)
 LOG_BASE = 1.0001  # Uniswap v3 tick base
+# Plausible ETH price bounds (USD). Used to pick correct orientation
+_PRICE_MIN, _PRICE_MAX = 50.0, 10000.0
+
+# ------------------------------------------------------------------
+# Tick → USD/ETH price helper
+# ------------------------------------------------------------------
+
+
+def tick_to_price_usd_per_eth(tick: int, stable: str) -> float:
+    """Convert *tick* to USD/ETH price heuristically.
+
+    We don't know whether *stable* is token0 or token1 in the pool (Uniswap sorts
+    tokens by address, not by symbol).  For each tick we try both orientations
+    and pick the first price that falls into a sensible range (50‒10 000 USD).
+    This works because any erroneous orientation yields either a microscopic or
+    astronomical price far outside typical ETH prices.
+    """
+    dec_s = STABLE_DECIMALS[stable]
+
+    # Core exponent – always positive for price magnitude
+    base = LOG_BASE ** abs(tick)
+
+    # Candidate prices (stable per ETH)
+    candidates = []
+
+    # 1) Assume tick encapsulates ETH priced in *stable* (token0=stable)
+    #    Price = 1.0001^{-tick} * 10^{dec_s-18}
+    price1 = (LOG_BASE ** (-tick)) * (10 ** (dec_s - 18))
+    candidates.append(price1)
+
+    # 2) Inverse orientation (token0=ETH)
+    price2 = (LOG_BASE ** (-tick)) * (10 ** (18 - dec_s))
+    candidates.append(price2)
+
+    # 3) Reciprocal of the above two (handles potential sign inversions)
+    candidates.append(1.0 / price1 if price1 != 0 else float("inf"))
+    candidates.append(1.0 / price2 if price2 != 0 else float("inf"))
+
+    # Pick first candidate inside plausible bounds
+    for p in candidates:
+        if _PRICE_MIN <= p <= _PRICE_MAX:
+            return p
+
+    # As fallback, return median of candidates (still better than None)
+    return float(np.median(candidates))
+
+# Map stable symbol → decimals (needed to adjust price ratios)
+STABLE_DECIMALS = {
+    "DAI": 18,
+    "USDC": 6,
+    "USDT": 6,
+}
 
 # ─────────────────────────── utils ────────────────────────────────
 
@@ -86,13 +138,10 @@ def csv_to_usd_per_eth_ticks(path: str) -> pd.DataFrame:
 
     df = _read_one_csv(path)
 
-    # Convert tick → USD/ETH price ticks by flipping sign (token0=stable, token1=ETH)
-    # USD per ETH = 1 / (ETH per USD) = 1.0001^{-tick}
-    usd_per_eth_tick = -df["tick"].values
-
+    # Store tick as-is; conversion to price done later with heuristics
     out = pd.DataFrame({
         "timestamp": df["timestamp"].values,
-        "usd_per_eth_tick": usd_per_eth_tick,
+        "tick": df["tick"].values,
         "stable": stable,
         "fee": fee,
     })
@@ -104,6 +153,7 @@ def resample_ticks(df: pd.DataFrame, freq: str="60s") -> pd.DataFrame:
     out = tmp.to_frame(name="usd_per_eth_tick").reset_index()
     out["stable"] = df["stable"].iloc[0]
     out["fee"]    = df["fee"].iloc[0]
+    out["scale"]  = df["scale"].iloc[0]
     return out
 
 # ─────────────────────────── event-stream builder ────────────────────────────
@@ -113,7 +163,7 @@ def build_event_stream(csv_paths: List[str]) -> Tuple[pd.DataFrame, List[str]]:
     events: List[pd.DataFrame] = []
     for p in tqdm(csv_paths, desc="Reading CSVs"):
         ticks = csv_to_usd_per_eth_ticks(p)
-        ticks["price"] = LOG_BASE ** ticks["usd_per_eth_tick"]
+        ticks["price"] = ticks.apply(lambda r: tick_to_price_usd_per_eth(int(r["tick"]), r["stable"]), axis=1)
         # Filter out obvious outliers (e.g., bad data)
         ticks = ticks[(ticks["price"] >= 50.0) & (ticks["price"] <= 10000.0)]
         if ticks.empty:
@@ -136,8 +186,7 @@ def build_price_matrix(csv_paths: List[str], freq="60s") -> Tuple[pd.DataFrame, 
     for p in tqdm(csv_paths, desc="Reading CSVs"):
         ticks   = csv_to_usd_per_eth_ticks(p)
         res     = resample_ticks(ticks, freq)
-        # Convert ticks → price (usd per eth)
-        res["price"] = LOG_BASE ** res["usd_per_eth_tick"]
+        res["price"] = res.apply(lambda r: tick_to_price_usd_per_eth(int(r["usd_per_eth_tick"]) , r["stable"]), axis=1)
         pool_name = f"{res['stable'].iloc[0]}ETH{res['fee'].iloc[0]}"
         res = res[["timestamp", "price"]].rename(columns={"price": pool_name})
         series.append(res)
@@ -240,9 +289,9 @@ def simulate_mean_reversion_events(events: pd.DataFrame, pools: List[str], thr_p
             if last_exit_ts.get(pool) is not None and last_exit_ts[pool] == ts:
                 continue
             if dev <= -threshold:   # LONG
-                open_pos[pool] = {"side": "long", "entry_ts": ts, "entry_price": price, "entry_dev": dev}
+                open_pos[pool] = {"side": "long", "entry_ts": ts, "entry_price": price, "entry_dev": dev, "entry_mean_price": mean_price}
             elif dev >= threshold:  # SHORT
-                open_pos[pool] = {"side": "short", "entry_ts": ts, "entry_price": price, "entry_dev": dev}
+                open_pos[pool] = {"side": "short", "entry_ts": ts, "entry_price": price, "entry_dev": dev, "entry_mean_price": mean_price}
             continue
 
         # Exit logic (mean reversion)
@@ -257,6 +306,8 @@ def simulate_mean_reversion_events(events: pd.DataFrame, pools: List[str], thr_p
                 "exit_ts": ts,
                 "entry_price": pos["entry_price"],
                 "exit_price": price,
+                "entry_mean_price": pos["entry_mean_price"],
+                "exit_mean_price": mean_price,
                 "pct_return": pct_ret_live - fee_frac,
             })
             open_pos.pop(pool)
@@ -271,6 +322,8 @@ def simulate_mean_reversion_events(events: pd.DataFrame, pools: List[str], thr_p
                 "exit_ts": ts,
                 "entry_price": pos["entry_price"],
                 "exit_price": price,
+                "entry_mean_price": pos["entry_mean_price"],
+                "exit_mean_price": mean_price,
                 "pct_return": pct_ret - fee_frac,
             })
             open_pos.pop(pool)
@@ -318,14 +371,14 @@ def simulate_zscore_reversion_events(events: pd.DataFrame, pools: List[str], *, 
 
         # Entry
         if pos is None:
-            if abs(dev) <= fee_frac:
+            if abs(dev) <= fee_frac:  # requiere cubrir las dos comisiones
                 continue  # no vale la pena abrir
             if last_exit_ts.get(pool) is not None and last_exit_ts[pool] == ts:
                 continue  # skip if just closed at the same ts
             if z <= -entry_z:
-                open_pos[pool] = {"side": "long", "entry_idx": idx, "entry_ts": ts, "entry_price": price, "entry_z": z}
+                open_pos[pool] = {"side": "long", "entry_idx": idx, "entry_ts": ts, "entry_price": price, "entry_z": z, "entry_mean_price": mean_price}
             elif z >= entry_z:
-                open_pos[pool] = {"side": "short", "entry_idx": idx, "entry_ts": ts, "entry_price": price, "entry_z": z}
+                open_pos[pool] = {"side": "short", "entry_idx": idx, "entry_ts": ts, "entry_price": price, "entry_z": z, "entry_mean_price": mean_price}
             continue
 
         # Stop-loss check (before standard exit conditions)
@@ -341,6 +394,8 @@ def simulate_zscore_reversion_events(events: pd.DataFrame, pools: List[str], *, 
                 "exit_price": price,
                 "entry_z": pos["entry_z"],
                 "exit_z": z,
+                "entry_mean_price": pos["entry_mean_price"],
+                "exit_mean_price": mean_price,
                 "pct_return": pct_ret_live - fee_frac,
                 "held_rows": idx - pos["entry_idx"],
             })
@@ -370,6 +425,8 @@ def simulate_zscore_reversion_events(events: pd.DataFrame, pools: List[str], *, 
                 "exit_price": price,
                 "entry_z": pos["entry_z"],
                 "exit_z": z,
+                "entry_mean_price": pos["entry_mean_price"],
+                "exit_mean_price": mean_price,
                 "pct_return": pct_ret - fee_frac,
                 "held_rows": held,
             })
@@ -389,8 +446,8 @@ def aggregate_returns(trades: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
     trades["year"]  = trades["exit_ts"].dt.year
     trades["month"] = trades["exit_ts"].dt.to_period("M")
 
-    monthly = trades.groupby("month")["pct_return"].sum().to_frame(name="sum_return")
-    yearly  = trades.groupby("year")["pct_return"].sum().to_frame(name="sum_return")
+    monthly = trades.groupby("month").agg(sum_return=("pct_return","sum"), sum_profit=("pnl","sum"))
+    yearly  = trades.groupby("year").agg(sum_return=("pct_return","sum"), sum_profit=("pnl","sum"))
     return monthly, yearly
 
 # ─────────────────────────── CLI ─────────────────────────────────
@@ -411,6 +468,7 @@ def main():
     p.add_argument("--notional", type=float, default=1000.0, help="Trade notional size in stable units per position (default 1000)")
     p.add_argument("--start_capital", type=float, default=80000.0, help="Initial capital in stable units (default 80000)")
     p.add_argument("--trades_csv", type=str, default="trades.csv", help="Output CSV file path for executed trades (default trades.csv)")
+    p.add_argument("--plot_pnl", action="store_true", help="Display cumulative PnL graph (stable units)")
 
     args = p.parse_args()
 
@@ -461,6 +519,26 @@ def main():
     print(f"Total strategy return over back-test: {total_pct*100:.2f}% (un-compounded) across {len(trades)} trades")
     print(f"Win rate: {win_trades}/{len(trades)} trades = {win_rate:.2f}%")
     print(f"Total profit: {total_profit:.2f} stable units (starting capital {args.start_capital:.2f} → final balance {final_balance:.2f})\n")
+
+    # Optional PnL plot
+    if args.plot_pnl and not trades.empty:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("matplotlib is not installed. Install it to enable plotting (pip install matplotlib).")
+        else:
+            hr("PnL GRAPH")
+            cum = trades.sort_values("exit_ts").copy()
+            cum["cum_pnl"] = cum["pnl"].cumsum()
+            plt.figure(figsize=(10,6))
+            plt.plot(cum["exit_ts"], cum["cum_pnl"], label="Cumulative PnL")
+            plt.xlabel("Exit timestamp")
+            plt.ylabel("Cumulative PnL (stable units)")
+            plt.title("Cumulative Strategy PnL Over Time")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
