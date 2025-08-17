@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-#  python analytics/stable_eth_meanrevert_bot.py \
-#     --data   ./data \
-#     --freq   120s \
-#     --mode   zscore \
-#     --report \
-#     --notional      1000 \
-#     --start_capital 80000 \
-#     --trades_csv    my_trades.csv
+# python analytics/stable_eth_meanrevert_bot.py --data ./data --mode zscore --lookback 100 --entry_z 3.0 --exit_z 0.3 --max_hold 1000 --notional 1000 --start_capital 80000 --trades_csv my_trades.csv --report --stop_pct 2.0 --open_fee_pct 0.01 
+
 """
 Mean-reversion bot for Stable/ETH pools
 ======================================
