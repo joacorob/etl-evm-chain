@@ -210,10 +210,13 @@ def simulate_mean_reversion(df: pd.DataFrame, pools: List[str], thr_pct: float=0
 
 # ───────────────── event-level simulations (no resampling) ────────────────
 
-def simulate_mean_reversion_events(events: pd.DataFrame, pools: List[str], thr_pct: float = 0.10) -> pd.DataFrame:
+def simulate_mean_reversion_events(events: pd.DataFrame, pools: List[str], thr_pct: float = 0.10, *, stop_pct: float = 2.0, open_fee_pct: float = 0.01) -> pd.DataFrame:
     """Mean-reversion on raw event stream (ordered by timestamp)."""
     threshold = thr_pct / 100.0
+    stop_thresh = stop_pct / 100.0
+    fee_frac    = open_fee_pct / 100.0
     last_price: Dict[str, float] = {}
+    last_exit_ts: Dict[str, pd.Timestamp] = {}
     open_pos: Dict[str, Dict[str, Any]] = {}
     trades: List[Dict[str, Any]] = []
 
@@ -236,6 +239,12 @@ def simulate_mean_reversion_events(events: pd.DataFrame, pools: List[str], thr_p
 
         # Entry logic
         if pos is None:
+            # Salta si la desviación no cubre el costo de apertura
+            if abs(dev) <= fee_frac:
+                continue
+            # avoid reopening a trade in the *exact* same timestamp it was just closed
+            if last_exit_ts.get(pool) is not None and last_exit_ts[pool] == ts:
+                continue
             if dev <= -threshold:   # LONG
                 open_pos[pool] = {"side": "long", "entry_ts": ts, "entry_price": price, "entry_dev": dev}
             elif dev >= threshold:  # SHORT
@@ -244,6 +253,21 @@ def simulate_mean_reversion_events(events: pd.DataFrame, pools: List[str], thr_p
 
         # Exit logic (mean reversion)
         side = pos["side"]
+        # Stop-loss: close the position if the unrealised loss reaches the threshold
+        pct_ret_live = (price - pos["entry_price"]) / pos["entry_price"] if side == "long" else (pos["entry_price"] - price) / pos["entry_price"]
+        if pct_ret_live <= -stop_thresh:
+            trades.append({
+                "pool": pool,
+                "side": side,
+                "entry_ts": pos["entry_ts"],
+                "exit_ts": ts,
+                "entry_price": pos["entry_price"],
+                "exit_price": price,
+                "pct_return": pct_ret_live - fee_frac,
+            })
+            open_pos.pop(pool)
+            last_exit_ts[pool] = ts
+            continue
         if (side == "long" and dev >= 0) or (side == "short" and dev <= 0):
             pct_ret = (price - pos["entry_price"]) / pos["entry_price"] if side == "long" else (pos["entry_price"] - price) / pos["entry_price"]
             trades.append({
@@ -253,19 +277,23 @@ def simulate_mean_reversion_events(events: pd.DataFrame, pools: List[str], thr_p
                 "exit_ts": ts,
                 "entry_price": pos["entry_price"],
                 "exit_price": price,
-                "pct_return": pct_ret,
+                "pct_return": pct_ret - fee_frac,
             })
             open_pos.pop(pool)
+            last_exit_ts[pool] = ts
 
     return pd.DataFrame(trades)
 
 
-def simulate_zscore_reversion_events(events: pd.DataFrame, pools: List[str], *, lookback: int = 1440, entry_z: float = 2.0, exit_z: float = 0.2, max_hold: int = 10080) -> pd.DataFrame:
+def simulate_zscore_reversion_events(events: pd.DataFrame, pools: List[str], *, lookback: int = 1440, entry_z: float = 2.0, exit_z: float = 0.2, max_hold: int = 10080, stop_pct: float = 2.0, open_fee_pct: float = 0.01) -> pd.DataFrame:
     """Z-score based mean-reversion on raw event stream."""
     last_price: Dict[str, float] = {}
+    last_exit_ts: Dict[str, pd.Timestamp] = {}
     dev_hist: Dict[str, deque] = {p: deque(maxlen=lookback) for p in pools}
     open_pos: Dict[str, Dict[str, Any]] = {}
     trades: List[Dict[str, Any]] = []
+    stop_thresh = stop_pct / 100.0
+    fee_frac    = open_fee_pct / 100.0
 
     for idx, row in events.iterrows():
         ts   = row["timestamp"]
@@ -296,10 +324,34 @@ def simulate_zscore_reversion_events(events: pd.DataFrame, pools: List[str], *, 
 
         # Entry
         if pos is None:
+            if abs(dev) <= fee_frac:
+                continue  # no vale la pena abrir
+            if last_exit_ts.get(pool) is not None and last_exit_ts[pool] == ts:
+                continue  # skip if just closed at the same ts
             if z <= -entry_z:
                 open_pos[pool] = {"side": "long", "entry_idx": idx, "entry_ts": ts, "entry_price": price, "entry_z": z}
             elif z >= entry_z:
                 open_pos[pool] = {"side": "short", "entry_idx": idx, "entry_ts": ts, "entry_price": price, "entry_z": z}
+            continue
+
+        # Stop-loss check (before standard exit conditions)
+        side = pos["side"]
+        pct_ret_live = (price - pos["entry_price"]) / pos["entry_price"] if side == "long" else (pos["entry_price"] - price) / pos["entry_price"]
+        if pct_ret_live <= -stop_thresh:
+            trades.append({
+                "pool": pool,
+                "side": side,
+                "entry_ts": pos["entry_ts"],
+                "exit_ts": ts,
+                "entry_price": pos["entry_price"],
+                "exit_price": price,
+                "entry_z": pos["entry_z"],
+                "exit_z": z,
+                "pct_return": pct_ret_live - fee_frac,
+                "held_rows": idx - pos["entry_idx"],
+            })
+            open_pos.pop(pool)
+            last_exit_ts[pool] = ts
             continue
 
         # Exit conditions
@@ -324,10 +376,11 @@ def simulate_zscore_reversion_events(events: pd.DataFrame, pools: List[str], *, 
                 "exit_price": price,
                 "entry_z": pos["entry_z"],
                 "exit_z": z,
-                "pct_return": pct_ret,
+                "pct_return": pct_ret - fee_frac,
                 "held_rows": held,
             })
             open_pos.pop(pool)
+            last_exit_ts[pool] = ts
 
     return pd.DataFrame(trades)
 
@@ -355,9 +408,11 @@ def main():
     p.add_argument("--thr",  type=float, default=0.10, help="(pct mode) Deviation threshold in percent (default 0.10)")
     p.add_argument("--mode", choices=["pct","zscore"], default="zscore", help="Back-test mode: pct (old) or zscore (improved)")
     p.add_argument("--lookback", type=int, default=1440, help="(zscore) Rolling window length in rows (default 1440 ≈1d @60s)")
-    p.add_argument("--entry_z", type=float, default=2.0, help="(zscore) |Z| threshold to open trade (default 2.0)")
-    p.add_argument("--exit_z",  type=float, default=0.2, help="(zscore) |Z| threshold to close trade (default 0.2)")
+    p.add_argument("--entry_z", type=float, default=3.0, help="(zscore) |Z| threshold to open trade (default 3.0 – more selective)")
+    p.add_argument("--exit_z",  type=float, default=0.3, help="(zscore) |Z| threshold to close trade (default 0.3)")
     p.add_argument("--max_hold", type=int, default=10080, help="(zscore) Max holding period in rows (default 10080 ≈1w @60s)")
+    p.add_argument("--stop_pct", type=float, default=2.0, help="Stop-loss threshold in percent (default 2.0)")
+    p.add_argument("--open_fee_pct", type=float, default=0.01, help="Fee percentage charged when opening a position (default 0.01)")
     p.add_argument("--report", action="store_true", help="Print trades & performance summary")
     p.add_argument("--notional", type=float, default=1000.0, help="Trade notional size in stable units per position (default 1000)")
     p.add_argument("--start_capital", type=float, default=80000.0, help="Initial capital in stable units (default 80000)")
@@ -372,7 +427,7 @@ def main():
 
     hr("SIMULATING")
     if args.mode == "pct":
-        trades = simulate_mean_reversion_events(events_df, pools, thr_pct=args.thr)
+        trades = simulate_mean_reversion_events(events_df, pools, thr_pct=args.thr, stop_pct=args.stop_pct, open_fee_pct=args.open_fee_pct)
     else:
         trades = simulate_zscore_reversion_events(
             events_df, pools,
@@ -380,11 +435,15 @@ def main():
             entry_z=args.entry_z,
             exit_z=args.exit_z,
             max_hold=args.max_hold,
+            stop_pct=args.stop_pct,
+            open_fee_pct=args.open_fee_pct,
         )
     print(f"✓ Completed: {len(trades)} trades generated")
 
     # Compute PnL for each trade based on fixed notional and persist to CSV
+    trades.insert(0, "id", np.arange(1, len(trades)+1))  # numeric trade id
     trades["pnl"] = trades["pct_return"] * args.notional  # profit/loss in stable units
+    trades["hit"] = trades["pct_return"] > 0  # true if trade profitable
     trades.to_csv(args.trades_csv, index=False)
 
     monthly, yearly = aggregate_returns(trades)
@@ -402,8 +461,11 @@ def main():
     total_pct = trades["pct_return"].sum() if not trades.empty else 0.0
     total_profit = trades["pnl"].sum() if not trades.empty else 0.0
     final_balance = args.start_capital + total_profit
+    win_trades = trades["hit"].sum() if not trades.empty else 0
+    win_rate = (win_trades / len(trades) * 100) if not trades.empty else 0.0
 
     print(f"Total strategy return over back-test: {total_pct*100:.2f}% (un-compounded) across {len(trades)} trades")
+    print(f"Win rate: {win_trades}/{len(trades)} trades = {win_rate:.2f}%")
     print(f"Total profit: {total_profit:.2f} stable units (starting capital {args.start_capital:.2f} → final balance {final_balance:.2f})\n")
 
 if __name__ == "__main__":
