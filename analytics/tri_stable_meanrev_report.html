@@ -1,0 +1,109 @@
+
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Tri-Stable Mean Reversion Report</title>
+<style>
+body{font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:24px;}
+h1,h2{margin:0 0 8px}
+table{border-collapse:collapse; margin:12px 0; width:100%;}
+th,td{border:1px solid #ddd; padding:6px 8px; text-align:right}
+th{text-align:left; background:#fafafa}
+code{background:#f4f4f4;padding:2px 4px}
+small{color:#666}
+</style></head><body>
+<h1>Tri-Stable Mean Reversion</h1>
+<small>Generated: 2025-08-18T12:43:36.625415Z</small>
+
+<h2>Parameters</h2>
+<table>
+<tr><th>Bar</th><td>1min</td><th>z_entry</th><td>2.0</td><th>z_exit</th><td>0.25</td></tr>
+<tr><th>roll_z</th><td>720</td><th>cost_bps</th><td>0.6</td><th>k_ar_diff</th><td>1</td></tr>
+<tr><th>tb_horizon</th><td>720</td><th>tb_stop_z</th><td>3.5</td><th>meta_threshold</th><td>0.55</td></tr>
+<tr><th>unit_stable</th><td>1000.0</td><th>min_basis_bps</th><td>5.0</td><th>use_kalman</th><td>False</td></tr>
+<tr><th colspan="2">Data dir</th><td colspan="4">../data</td></tr>
+</table>
+
+<h2>Johansen Weights</h2>
+<p><code>w = [0.00014, 0.706968, -0.707245]</code></p>
+
+<h2>OU Parameters</h2>
+<table>
+<tr><th>mu</th><th>phi</th><th>kappa</th><th>half-life (bars)</th></tr>
+<tr><td>-0.001051</td><td>0.010682</td><td>4.539188</td><td>0.15</td></tr>
+</table>
+
+<h2>Backtest Stats</h2>
+<table>
+<tr><th></th><th>Return %</th><th>Sharpe</th><th>Turnover</th><th>Hit Ratio</th></tr>
+<tr><th>Base</th><td>4497776.39</td><td>4.712</td><td>0.0272</td><td>0.507</td></tr>
+<tr><th>Meta</th><td>4497776.39</td><td>4.712</td><td>0.0272</td><td>0.507</td></tr>
+</table>
+
+<h2>Monthly PnL (%)</h2>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th>PnL_%</th>
+    </tr>
+    <tr>
+      <th>ts</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>2024-08-31 00:00:00+00:00</th>
+      <td>129.98</td>
+    </tr>
+    <tr>
+      <th>2024-09-30 00:00:00+00:00</th>
+      <td>83.96</td>
+    </tr>
+    <tr>
+      <th>2024-10-31 00:00:00+00:00</th>
+      <td>80.82</td>
+    </tr>
+    <tr>
+      <th>2024-11-30 00:00:00+00:00</th>
+      <td>52.95</td>
+    </tr>
+    <tr>
+      <th>2024-12-31 00:00:00+00:00</th>
+      <td>60.36</td>
+    </tr>
+    <tr>
+      <th>2025-01-31 00:00:00+00:00</th>
+      <td>56.87</td>
+    </tr>
+    <tr>
+      <th>2025-02-28 00:00:00+00:00</th>
+      <td>84.87</td>
+    </tr>
+    <tr>
+      <th>2025-03-31 00:00:00+00:00</th>
+      <td>60.98</td>
+    </tr>
+    <tr>
+      <th>2025-04-30 00:00:00+00:00</th>
+      <td>84.40</td>
+    </tr>
+    <tr>
+      <th>2025-05-31 00:00:00+00:00</th>
+      <td>432.77</td>
+    </tr>
+    <tr>
+      <th>2025-06-30 00:00:00+00:00</th>
+      <td>71.21</td>
+    </tr>
+    <tr>
+      <th>2025-07-31 00:00:00+00:00</th>
+      <td>52.83</td>
+    </tr>
+    <tr>
+      <th>2025-08-31 00:00:00+00:00</th>
+      <td>39.89</td>
+    </tr>
+  </tbody>
+</table>
+
+</body></html>

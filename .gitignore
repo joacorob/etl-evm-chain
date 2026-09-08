@@ -9,9 +9,15 @@ bin/
 # Build & dependency
 vendor/
 
+# Python
+__pycache__/
+*.pyc
+.venv/
+
 # Project specific artifacts
 .progress.json
-data/*.csv
+data/
+indexer
 internal/progress/
 
 # Local configuration files
